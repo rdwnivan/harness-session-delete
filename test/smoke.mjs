@@ -32,6 +32,8 @@ const SUBAGENT = '11111111-2222-3333-4444-555555555555'
 const CHILD = 'session-22222222-3333-4444-5555-666666666666'
 /** A Session whose only child is a hidden subagent Session. */
 const PARENT = 'session-44444444-5555-6666-7777-888888888888'
+/** An archived id from an earlier app run: no bytes, no live Session. */
+const TOMBSTONE = 'session-00000000-1111-2222-3333-444444444444'
 
 async function seed(sessionId) {
   const dir = join(home, 'sessions', PROJECT, sessionId)
@@ -55,7 +57,16 @@ const unarchived = []
 const graphChanges = []
 let deleted = false
 
-function makeCtx({ live = false, archive, withModules = false, forgetSession = false, children = [], listFault = false } = {}) {
+function makeCtx({
+  live = false,
+  archive,
+  withModules = false,
+  forgetSession = false,
+  children = [],
+  listFault = false,
+  accounted = true,
+  archived = [],
+} = {}) {
   const routes = new Map()
   const ctx = {
     effect: (callback) => { callback() },
@@ -90,10 +101,10 @@ function makeCtx({ live = false, archive, withModules = false, forgetSession = f
       },
     },
     workspaceRegistry: {
-      archivedSessionIds: [],
+      archivedSessionIds: [...archived],
       list: () => [{
         path: 'C:\\workspace',
-        sessionIds: [SESSION],
+        sessionIds: accounted ? [SESSION] : [],
         detachSession: async (id) => { detached.push(id) },
       }],
       archiveSession: archive ?? (async () => {}),
@@ -265,6 +276,7 @@ assert.ok((await stat(childSeed.dir)).isDirectory(), 'the subagent child must su
 // --- happy path -------------------------------------------------------------
 const detachedBeforeHappy = detached.length
 const emittedBeforeHappy = emitted.length
+const unarchivedBeforeHappy = unarchived.length
 const happy = makeCtx({ live: true })
 apply(happy.ctx)
 response = await postTo(happy.routes.get(DELETE_PATH), { sessionId: SESSION })
@@ -273,6 +285,7 @@ assert.equal(response.status, 200)
 assert.equal(report.ok, true)
 assert.equal(report.sessionId, SESSION)
 assert.equal(report.live, true)
+assert.equal(report.tombstone, true, 'a resident Session keeps its archive entry as the deletion tombstone')
 assert.equal(report.workspaceDetached, true)
 assert.equal(report.transcriptDirs.length, 1)
 assert.equal(report.projections.length, 1)
@@ -283,8 +296,61 @@ assert.equal(detached.length, detachedBeforeHappy + 1)
 assert.equal(detached.at(-1), SESSION)
 assert.equal(emitted.length, emittedBeforeHappy + 1)
 assert.deepEqual(emitted.at(-1), ['api-session/removed', SESSION])
+assert.equal(unarchived.length, unarchivedBeforeHappy, 'a resident Session must not be unarchived: the entry is what hides the row')
 assert.ok((await stat(join(home, 'sessions', PROJECT, OTHER))).isDirectory(), 'sibling sessions must survive')
 deleted = true
+
+// --- a Session the app no longer holds drops its archive entry --------------
+// (nothing serves it any more, so a tombstone would only leave the registry
+// counting an id that can never be shown or restored)
+const quietSeed = await seed(SESSION)
+const quiet = makeCtx()
+apply(quiet.ctx)
+response = await postTo(quiet.routes.get(DELETE_PATH), { sessionId: SESSION })
+const quietReport = await response.json()
+assert.equal(response.status, 200)
+assert.equal(quietReport.live, false)
+assert.equal(quietReport.tombstone, false, 'a non-resident Session leaves no tombstone behind')
+assert.equal(unarchived.at(-1), SESSION, 'a non-resident Session has its archive entry cleared')
+assert.deepEqual(quietReport.warnings, [])
+await assert.rejects(stat(quietSeed.dir), 'the transcript directory must be gone')
+
+// --- the residue of an earlier deletion finishes instead of refusing --------
+// The user's report: a resident Session whose bytes are already gone and whose
+// accounting was already detached. Retrying used to answer `session/not-found`,
+// which the page treats as "already gone" while the row stayed on screen.
+const residueEmittedBefore = emitted.length
+const residue = makeCtx({ live: true, forgetSession: true, accounted: false })
+apply(residue.ctx)
+response = await postTo(residue.routes.get(DELETE_PATH), { sessionId: SESSION })
+const residueReport = await response.json()
+assert.equal(response.status, 200, 'a resident residue must be hidden, not refused')
+assert.equal(residueReport.ok, true)
+assert.equal(residueReport.residual, true)
+assert.equal(residueReport.tombstone, true)
+assert.equal(residueReport.live, true)
+assert.equal(residueReport.workspace, null)
+assert.deepEqual(residueReport.transcriptDirs, [])
+assert.equal(emitted.length, residueEmittedBefore + 1)
+assert.deepEqual(emitted.at(-1), ['api-session/removed', SESSION])
+
+// --- an id nobody knows is still refused -----------------------------------
+const unknown = makeCtx({ accounted: false, forgetSession: true })
+apply(unknown.ctx)
+response = await postTo(unknown.routes.get(DELETE_PATH), { sessionId: SESSION })
+assert.equal(response.status, 404, 'an unknown, non-resident id stays not-found')
+assert.equal((await response.json()).code, 'session/not-found')
+
+// --- tombstones of an earlier run are swept, live/persisted ids are kept ----
+const sweptBefore = unarchived.length
+const stale = makeCtx({ archived: [TOMBSTONE, OTHER] })
+apply(stale.ctx)
+await new Promise((resolve) => setTimeout(resolve, 50))
+assert.deepEqual(unarchived.slice(sweptBefore), [TOMBSTONE], 'only a tombstone with nothing left to hide is cleared')
+const sweep = JSON.parse(await readFile(join(home, 'session-delete', 'tombstones.json'), 'utf8'))
+assert.equal(sweep.event, 'stale-tombstones-cleared')
+assert.deepEqual(sweep.cleared, [TOMBSTONE])
+assert.equal(sweep.kept, 1, 'a persisted Session keeps its archive entry')
 
 // --- audit trails -----------------------------------------------------------
 const deletions = await readFile(join(home, 'session-delete', 'deletions.jsonl'), 'utf8')

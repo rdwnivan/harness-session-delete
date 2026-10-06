@@ -7,7 +7,9 @@
  *   1. the transcript directory is gone,
  *   2. the projection-cache row is gone,
  *   3. the workspace account no longer lists it (`sessionIds`),
- *   4. it is not left in `archivedSessionIds`,
+ *   4. it is not left in `archivedSessionIds` — unless the deletion was recorded
+ *      as leaving a tombstone, which is what hides the row of a Session the app
+ *      still holds live (see `index.js`),
  *   5. it is not left in `pinnedSessionIds`,
  *   6. no membership dangles (an accounted id with no transcript),
  *   7. no Session id exists in two project directories (the startup brick:
@@ -73,6 +75,38 @@ export async function projectionRows(home, id) {
 }
 
 /**
+ * The last successful audit line the plugin wrote for one session.
+ *
+ * The deletion audit is the only record of what the plugin actually did, and it
+ * is what tells this offline checker whether an entry left in
+ * `archivedSessionIds` is the expected tombstone of a session the app still
+ * holds live, or leftover bookkeeping.
+ *
+ * @param home - DSH home.
+ * @param sessionId - session to look up.
+ * @returns the parsed line, or undefined when no successful deletion was logged.
+ */
+export async function lastDeletion(home, sessionId) {
+  let text = ''
+  try {
+    text = await readFile(join(home, 'session-delete', 'deletions.jsonl'), 'utf8')
+  } catch {
+    return undefined
+  }
+  const lines = text.split('\n').filter((line) => line.trim() !== '')
+  for (let index = lines.length - 1; index >= 0; index--) {
+    let entry
+    try {
+      entry = JSON.parse(lines[index])
+    } catch {
+      continue
+    }
+    if (entry?.sessionId === sessionId && entry?.ok === true) return entry
+  }
+  return undefined
+}
+
+/**
  * Check one DSH home.
  * @param options - `{ home, sessionId, storeOnly }`.
  * @returns `{ checks, info, failures }`.
@@ -91,6 +125,11 @@ export async function verifyHome({ home, sessionId, storeOnly = false }) {
   const workspaces = Object.entries(state?.tables?.workspaces ?? {})
   const archived = state?.global?.archivedSessionIds ?? []
   const pinned = state?.global?.pinnedSessionIds ?? []
+  const deletion = storeOnly ? undefined : await lastDeletion(home, sessionId)
+  // A session the app still holds live cannot leave `session.list`, so the
+  // plugin leaves its archive entry as the tombstone that hides the row. That
+  // entry is expected exactly when the recorded deletion says it was left.
+  const tombstone = deletion?.tombstone === true
 
   if (!storeOnly) {
     const dirs = await transcriptDirs(home, sessionId)
@@ -99,7 +138,12 @@ export async function verifyHome({ home, sessionId, storeOnly = false }) {
     check(rows.length === 0, `baris cache proyeksi terhapus (sisa: ${rows.length})`)
     const owners = workspaces.filter(([, record]) => (record?.sessionIds ?? []).includes(sessionId)).map(([id]) => id)
     check(owners.length === 0, `keanggotaan workspace dilepas (pemilik tersisa: ${owners.length})`)
-    check(!archived.includes(sessionId), 'tidak tertinggal di archivedSessionIds')
+    check(
+      archived.includes(sessionId) === tombstone,
+      tombstone
+        ? 'tertinggal di archivedSessionIds sebagai batu nisan sesi yang masih hidup (sesuai)'
+        : 'tidak tertinggal di archivedSessionIds',
+    )
     check(!pinned.includes(sessionId), 'tidak tertinggal di pinnedSessionIds')
   }
 

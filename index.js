@@ -9,17 +9,29 @@
  * Ordering is deliberate and is what keeps the app healthy:
  *   1. refuse a session whose work is running (the registry's own archive gate),
  *   2. remove the transcript bytes first, so a locked file changes nothing,
- *   3. detach the workspace accounting, then clear the global archive/pin sets,
+ *   3. detach the workspace accounting, keep the archive entry of a *resident*
+ *      session and clear the global pin set,
  *   4. drop projection rows and tell every open page the session is gone.
  *
  * If step 2 fails, step 3 never runs and the archived state is rolled back, so a
  * refused deletion leaves the store exactly as it was.
  *
+ * Why a resident Session keeps its archive entry: `session.list` serves every
+ * Session the app still holds live, no matter what persistence says, so the row
+ * of a just-deleted live Session comes back on the next list pull — which is
+ * what made "delete" look like a no-op. The registry's archive set is the
+ * shipped "hidden from every grouping surface" state, so the entry is left in
+ * place as the tombstone that keeps the row away until the app releases the
+ * Session; it also keeps the archived-session gate from letting the residue run
+ * and write its transcript back. An activation sweep drops tombstones whose
+ * Session is gone for good, so the set does not accumulate.
+ *
  * This module imports nothing but Node builtins on purpose: a profile-installed
  * bundle must not depend on how the launcher anchors `@deepseek-ai/*` resolution.
- * It also writes two small files under `<DSH_HOME>/session-delete/` — an
- * activation receipt and an append-only deletion log — so that "did the plugin
- * load?" and "what did it delete?" are answerable without a browser.
+ * It also writes a few small files under `<DSH_HOME>/session-delete/` — an
+ * activation receipt, an append-only deletion log, and the tombstone-sweep
+ * receipt — so that "did the plugin load?" and "what did it delete?" are
+ * answerable without a browser.
  */
 import { appendFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -39,7 +51,7 @@ const HELLO_PATH = '/api/session-delete.hello'
 const SESSION_ID = /^(?:session-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 
 /** Bumped when the deletion sequence changes; recorded in the receipts. */
-const VERSION = '1.0.0'
+const VERSION = '1.1.0'
 
 /** This package's name: the browser module id and the boot-graph row id. */
 const PACKAGE_NAME = 'harness-session-delete'
@@ -101,6 +113,12 @@ export function apply(ctx) {
     home: resolveHome(),
   })
 
+  // Tombstones outlive the app run they were written in: an archived id whose
+  // Session is neither live nor persisted has nothing left to hide, so it is
+  // dropped instead of accumulating in the registry's global set. Best effort,
+  // never blocking activation.
+  void sweepTombstones(ctx)
+
   // Diagnostic receipt only: prove from the Host side that this package's browser
   // half was published to the page's boot graph. Optional service, so a profile
   // without the Web client composition simply never writes it.
@@ -146,6 +164,58 @@ export function apply(ctx) {
       })
     }
   })
+}
+
+/**
+ * Drop the deletion tombstones of earlier app runs.
+ *
+ * A tombstone is an archived id whose Session the app no longer holds and whose
+ * bytes are gone: it can hide nothing, cannot be restored, and would keep the
+ * registry counting a Session that cannot be shown or deleted. Ids that are
+ * still live or still persisted are never touched, and any failure leaves the
+ * whole set as it was.
+ *
+ * The registry's state may still be loading when this plugin activates, so a
+ * single delayed retry covers that gap. Nothing here may fail activation.
+ *
+ * @param ctx - Cordis context carrying the Session store and workspace registry.
+ */
+async function sweepTombstones(ctx) {
+  for (const delay of [0, 3000]) {
+    if (delay > 0) await new Promise((resolve) => { setTimeout(resolve, delay) })
+    try {
+      const registry = ctx.workspaceRegistry
+      const archived = [...registry.archivedSessionIds]
+      if (archived.length === 0) return
+
+      const live = new Set(ctx.sessions.list().map((session) => session.id))
+      const cleared = []
+      for (const sessionId of archived) {
+        if (live.has(sessionId)) continue
+        if (await readStoredHeader(ctx, sessionId) !== undefined) continue
+        await registry.unarchiveSession(sessionId)
+        cleared.push(sessionId)
+      }
+      if (cleared.length > 0) {
+        await record('tombstones.json', {
+          at: new Date().toISOString(),
+          version: VERSION,
+          event: 'stale-tombstones-cleared',
+          cleared,
+          kept: archived.length - cleared.length,
+        })
+      }
+      return
+    } catch (error) {
+      if (delay === 0) continue
+      void record('errors.jsonl', {
+        at: new Date().toISOString(),
+        version: VERSION,
+        event: 'tombstone-sweep-failed',
+        message: String(error?.message ?? error),
+      })
+    }
+  }
 }
 
 /** Record that the browser half reached the page; never fails the page. */
@@ -230,12 +300,6 @@ async function deleteSession(ctx, sessionId) {
   const owner = owningWorkspace(registry, sessionId)
   const live = ctx.sessions.get(sessionId) !== undefined
 
-  if (stored === undefined && owner === undefined) {
-    const missing = new Error(`session "${sessionId}" is not stored and no workspace accounts for it`)
-    missing.code = 'session/not-found'
-    throw missing
-  }
-
   // A Session another Session was forked or spawned from is part of a lineage:
   // deleting it out from under a visible child is the caller's decision to make
   // first, so a forked child refuses the deletion. Subagent children are hidden
@@ -249,6 +313,20 @@ async function deleteSession(ctx, sessionId) {
     error.code = 'session/has-children'
     error.children = children.blocking
     throw error
+  }
+
+  if (stored === undefined && owner === undefined) {
+    // Nothing is persisted and no workspace accounts for the id. That is either
+    // an id nobody knows, or the residue of a deletion whose bytes are already
+    // gone while the app still holds the Session live — the case whose row a
+    // page keeps showing, and whose retry used to answer "not found" and change
+    // nothing. Finish that deletion instead of refusing it.
+    if (live === false) {
+      const missing = new Error(`session "${sessionId}" is not stored and no workspace accounts for it`)
+      missing.code = 'session/not-found'
+      throw missing
+    }
+    return await finishResidue(ctx, sessionId, children, warnings)
   }
 
   // Admission first: the registry's archive check is the shipped answer to
@@ -266,7 +344,12 @@ async function deleteSession(ctx, sessionId) {
   }
 
   const workspaceDetached = await detach(owner, sessionId, warnings)
-  await clearArchive(registry, sessionId, warnings)
+  // A resident Session stays in `session.list` for as long as the app holds it,
+  // so its archive entry is what keeps the deleted row hidden (see the module
+  // header). A Session that is not resident leaves the list with its bytes, so
+  // its archive entry is dropped and the set stays honest.
+  const tombstone = live
+  if (!tombstone) await clearArchive(registry, sessionId, warnings)
   await clearPin(registry, sessionId, warnings)
   const projections = await removeProjectionRows(sessionId, warnings)
 
@@ -279,10 +362,51 @@ async function deleteSession(ctx, sessionId) {
     ok: true,
     sessionId,
     live,
+    tombstone,
     workspace: owner?.path ?? null,
     storedCwd: stored?.header?.cwd ?? null,
     transcriptDirs,
     workspaceDetached,
+    projections,
+    subagentChildren: children.subagent,
+    warnings,
+  }
+}
+
+/**
+ * Finish a deletion whose bytes are already gone.
+ *
+ * The id survives only as a resident Session, which `session.list` serves while
+ * the app holds it; archiving it is the shipped way to hide it from every
+ * grouping surface, so a retry on such a row now removes the row instead of
+ * answering "not found" and leaving the page exactly as it was.
+ *
+ * @param ctx - Cordis context.
+ * @param sessionId - The resident, already-byteless session to hide.
+ * @param children - Lineage report already computed for the caller.
+ * @param warnings - Collector for non-fatal bookkeeping failures.
+ * @returns A report of everything that was removed.
+ */
+async function finishResidue(ctx, sessionId, children, warnings) {
+  const registry = ctx.workspaceRegistry
+  // Bytes first, then bookkeeping: a leftover transcript that refuses removal
+  // must leave the session exactly as visible as it was.
+  const transcriptDirs = await removeTranscripts(sessionId)
+  await admit(registry, sessionId, warnings)
+  await clearPin(registry, sessionId, warnings)
+  const projections = await removeProjectionRows(sessionId, warnings)
+  ctx.emit('api-session/removed', sessionId)
+
+  return {
+    ok: true,
+    sessionId,
+    live: true,
+    residual: true,
+    tombstone: true,
+    workspace: null,
+    storedCwd: null,
+    transcriptDirs,
+    workspaceDetached: false,
     projections,
     subagentChildren: children.subagent,
     warnings,
@@ -346,7 +470,18 @@ function owningWorkspace(registry, sessionId) {
   return undefined
 }
 
-/** @returns whether this call is what put the session into the archive set. */
+/**
+ * Admit a session for deletion and leave it archived.
+ *
+ * The archive write is the registry's own activity gate — it refuses a session
+ * whose turn, subagent, job, or reminder is still live — and, when the session
+ * is resident, it doubles as the tombstone that keeps the deleted row hidden.
+ *
+ * @param registry - Workspace registry.
+ * @param sessionId - The session being deleted.
+ * @param warnings - Collector for non-fatal bookkeeping failures.
+ * @returns whether this call is what put the session into the archive set.
+ */
 async function admit(registry, sessionId, warnings) {
   const alreadyArchived = registry.archivedSessionIds.includes(sessionId)
   try {

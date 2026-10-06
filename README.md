@@ -56,6 +56,17 @@ The package has no build script, so pnpm's blocked-build-scripts prompt never ap
 2. Choose **Delete session** (destructive colour, below *Archive session*) and confirm.
 3. The row disappears: transcript, projection-cache row, and workspace accounting are gone.
 
+A session the app is still **holding live** (it was opened or ran a turn in this app run) cannot leave
+`session.list` — the Host serves every resident session from memory, whatever persistence says. For that
+case the plugin leaves the session's registry **archive entry** in place: that is the shipped *"hidden
+from every grouping surface"* state, so the row disappears at once and stays gone, the archived-session
+gate keeps the residue from running and writing its transcript back, and the app forgets the session for
+good on the next launch. Leftover tombstones are swept when the plugin next activates, so the archive set
+does not accumulate.
+
+Clicking delete again on a row that is already gone (the residue of an earlier deletion) finishes the job
+instead of reporting "not found": the row is hidden the same way.
+
 ## What it refuses, and why
 
 | Response | Meaning |
@@ -64,7 +75,7 @@ The package has no build script, so pnpm's blocked-build-scripts prompt never ap
 | `409 session/has-children` | a visible Session was **forked** from this one; the body lists the child to delete first |
 | `409 session/children-unreadable` | stored Sessions could not be read, so the lineage check cannot be trusted; nothing is deleted |
 | `409 session/in-use` | the transcript is still held open by the running app (Windows); switch away and retry |
-| `404 session/not-found` | already gone; the page settles quietly and refreshes its list |
+| `404 session/not-found` | no such session: neither stored, nor resident, nor accounted for by a workspace |
 | `400 invalid-session-id` | not a Session id — no filesystem path is ever derived from caller input |
 
 ## Deletion order (why it is safe)
@@ -73,9 +84,10 @@ The package has no build script, so pnpm's blocked-build-scripts prompt never ap
    session?"* gate, so nothing is ever removed under running work.
 2. **Bytes first** — remove `<DSH_HOME>/sessions/<project>/<id>/`. If that fails (a locked transcript),
    the archive write is rolled back and **nothing else changed**.
-3. **Bookkeeping** — `workspace.detachSession(id)`, then clear the archive and pin sets. Always through
-   the domain store: `workspace.json` is **never** edited by hand, because one invalid byte there aborts
-   `storageDomain.open` and the GUI then cannot open workspaces at all.
+3. **Bookkeeping** — `workspace.detachSession(id)`, then clear the pin set and, unless the session is
+   still resident, the archive entry (a resident session keeps it as the tombstone described above).
+   Always through the domain store: `workspace.json` is **never** edited by hand, because one invalid
+   byte there aborts `storageDomain.open` and the GUI then cannot open workspaces at all.
 4. **Cache and notice** — drop the projection-cache rows and tell every open page
    (`api-session/removed`).
 
@@ -106,7 +118,9 @@ context.
 The plugin also leaves an audit trail in `<DSH_HOME>/session-delete/`:
 
 - `status.json` — activation receipt (time, version, routes).
-- `deletions.jsonl` — one line per request, refusals included.
+- `deletions.jsonl` — one line per request, refusals included; a successful line records whether the
+  deletion left a tombstone for a resident session.
+- `tombstones.json` — the stale archive entries cleared at the last activation, if any.
 - `client.jsonl` — browser receipts (`apply`, `menu-row-render`).
 - `client-graph.json` — whether the package reached the page's boot graph.
 
@@ -118,6 +132,9 @@ The plugin also leaves an audit trail in `<DSH_HOME>/session-delete/`:
   browser; a host-themed dialog (via the `shell.overlay` slot) is not implemented yet.
 - Subagent children do not block a deletion — they are hidden from the sidebar, so blocking on them
   would make a parent permanently undeletable. They are reported in the response and left on disk.
+- A session the app still holds live is hidden with an archive entry rather than removed from
+  `session.list`, because no shipped API releases the app's residency; its row therefore reappears if
+  that filter is set to **show archived** sessions, and it is gone completely after a relaunch.
 - Deleting is irreversible: no trash, no undo.
 
 ## Uninstall

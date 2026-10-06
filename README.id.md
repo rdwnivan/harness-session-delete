@@ -56,6 +56,17 @@ Paket ini tidak punya build script, jadi peringatan *blocked build scripts* dari
 2. Pilih **Delete session** (warna merah, di bawah *Archive session*), lalu konfirmasi.
 3. Barisnya hilang: transkrip, baris cache proyeksi, dan pembukuan workspace ikut bersih.
 
+Sesi yang masih **dipegang hidup** oleh aplikasi (pernah dibuka atau menjalankan turn di sesi aplikasi ini)
+tidak bisa keluar dari `session.list` — Host menyajikan setiap sesi residen dari memori, apa pun kata
+persistence. Untuk kasus itu plugin membiarkan **entri archive** sesi tersebut di registry: itulah state
+resmi *"tersembunyi dari setiap permukaan grouping"*, jadi barisnya langsung hilang dan tetap hilang, gate
+archived-session mencegah residunya berjalan dan menulis transkripnya kembali, dan aplikasi melupakannya
+sepenuhnya saat dijalankan ulang. Sisa batu nisan dibersihkan saat plugin aktif berikutnya, jadi himpunan
+archive tidak menumpuk.
+
+Menekan delete lagi pada baris yang sebenarnya sudah terhapus (residu penghapusan sebelumnya) akan
+menuntaskan pekerjaannya, bukan menjawab "not found": barisnya disembunyikan dengan cara yang sama.
+
 ## Yang ditolak, dan alasannya
 
 | Respons | Arti |
@@ -64,7 +75,7 @@ Paket ini tidak punya build script, jadi peringatan *blocked build scripts* dari
 | `409 session/has-children` | ada sesi **fork** yang berasal dari sesi ini; body memuat id anak yang harus dihapus dulu |
 | `409 session/children-unreadable` | daftar sesi tersimpan tidak bisa dibaca, jadi pemeriksaan lineage tidak bisa dipercaya; tidak ada yang dihapus |
 | `409 session/in-use` | transkrip masih dipegang proses yang berjalan (Windows); pindah sesi lalu ulangi |
-| `404 session/not-found` | sudah tidak ada; halaman menutupnya tanpa notifikasi dan menyegarkan daftarnya |
+| `404 session/not-found` | sesi itu memang tidak ada: tidak tersimpan, tidak residen, dan tidak tercatat workspace mana pun |
 | `400 invalid-session-id` | bukan id sesi — tidak ada path filesystem yang diturunkan dari input pemanggil |
 
 ## Urutan penghapusan (kenapa aman)
@@ -73,8 +84,9 @@ Paket ini tidak punya build script, jadi peringatan *blocked build scripts* dari
    jadi tidak ada berkas yang dihapus di bawah pekerjaan yang berjalan.
 2. **Byte dulu** — hapus `<DSH_HOME>/sessions/<project>/<id>/`. Kalau gagal (transkrip terkunci), tulisan
    archive di-rollback dan **tidak ada** state lain yang berubah.
-3. **Pembukuan** — `workspace.detachSession(id)`, lalu bersihkan himpunan archive dan pin. Selalu lewat
-   domain store: `workspace.json` **tidak pernah** diedit manual, karena satu byte saja yang tidak valid
+3. **Pembukuan** — `workspace.detachSession(id)`, lalu bersihkan himpunan pin dan — kecuali sesinya masih
+   residen — entri archive (sesi residen menyimpannya sebagai batu nisan di atas). Selalu lewat domain
+   store: `workspace.json` **tidak pernah** diedit manual, karena satu byte saja yang tidak valid
    menggagalkan `storageDomain.open` dan GUI tidak bisa membuka workspace sama sekali.
 4. **Cache dan notifikasi** — buang baris cache proyeksi dan beri tahu setiap halaman yang terbuka
    (`api-session/removed`).
@@ -105,7 +117,9 @@ web (`window.__ModuleLoader__.load` → `factory(require)`), lalu mengaktifkanny
 Plugin juga meninggalkan jejak audit di `<DSH_HOME>/session-delete/`:
 
 - `status.json` — receipt aktivasi (waktu, versi, route).
-- `deletions.jsonl` — satu baris per permintaan, termasuk yang ditolak.
+- `deletions.jsonl` — satu baris per permintaan, termasuk yang ditolak; baris sukses mencatat apakah
+  penghapusan meninggalkan batu nisan untuk sesi residen.
+- `tombstones.json` — entri archive basi yang dibersihkan pada aktivasi terakhir, kalau ada.
 - `client.jsonl` — receipt dari half browser (`apply`, `menu-row-render`).
 - `client-graph.json` — apakah paket ini sudah masuk boot graph halaman.
 
@@ -116,6 +130,9 @@ Plugin juga meninggalkan jejak audit di `<DSH_HOME>/session-delete/`:
   host (lewat slot `shell.overlay`) belum diimplementasikan.
 - Anak subagent tidak memblokir penghapusan — mereka tersembunyi dari sidebar, jadi memblokirnya akan
   membuat sesi induk tidak pernah bisa dihapus. Mereka dilaporkan di respons dan dibiarkan di disk.
+- Sesi yang masih dipegang hidup oleh aplikasi disembunyikan lewat entri archive, bukan dikeluarkan dari
+  `session.list`, karena tidak ada API resmi yang melepas residency aplikasi; barisnya muncul lagi kalau
+  filter diatur ke **show archived**, dan benar-benar hilang setelah aplikasi dijalankan ulang.
 - Menghapus tidak bisa dibatalkan: tidak ada trash, tidak ada undo.
 
 ## Copot

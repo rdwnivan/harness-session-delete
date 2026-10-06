@@ -20,6 +20,8 @@ const KEPT = 'session-keep-1111-1111-1111-111111111111'
  * @param options.deletedDir - DELETED has a transcript directory.
  * @param options.audit - deletions.jsonl mentions DELETED.
  * @param options.duplicate - DELETED exists in two project directories.
+ * @param options.tombstone - the audit line says the deletion left a tombstone.
+ * @param options.archived - workspace.json lists DELETED as archived.
  */
 async function makeHome(options = {}) {
   const home = await mkdtemp(join(tmpdir(), 'harness-session-delete-'))
@@ -39,7 +41,12 @@ async function makeHome(options = {}) {
   await mkdir(join(home, 'storages'), { recursive: true })
   await writeFile(join(home, 'storages', 'workspace.json'), JSON.stringify({
     unit: { name: 'workspace', version: 2 },
-    global: { initialized: true, workspaceIds: ['W1'], archivedSessionIds: [], pinnedSessionIds: [] },
+    global: {
+      initialized: true,
+      workspaceIds: ['W1'],
+      archivedSessionIds: options.archived ? [DELETED] : [],
+      pinnedSessionIds: [],
+    },
     tables: {
       workspaces: {
         W1: {
@@ -55,7 +62,11 @@ async function makeHome(options = {}) {
 
   if (options.audit) {
     await mkdir(join(home, 'session-delete'), { recursive: true })
-    await writeFile(join(home, 'session-delete', 'deletions.jsonl'), `{"sessionId":"${DELETED}","ok":true}\n`)
+    await writeFile(
+      join(home, 'session-delete', 'deletions.jsonl'),
+      `{"sessionId":"${DELETED}","ok":false,"code":"session/not-found"}\n`
+      + `{"sessionId":"${DELETED}","ok":true,"live":${options.tombstone === true},"tombstone":${options.tombstone === true}}\n`,
+    )
   }
   return home
 }
@@ -68,6 +79,35 @@ try {
   const doneReport = await verifyHome({ home: done, sessionId: DELETED })
   assert.equal(doneReport.failures, 0, renderReport(doneReport).join('\n'))
   assert.match(renderReport(doneReport).at(-1), /SEMUA PEMERIKSAAN LOLOS/)
+
+  // A recorded tombstone passes with the archived entry still in place ...
+  const tombstoned = await makeHome({ audit: true, tombstone: true, archived: true })
+  homes.push(tombstoned)
+  const tombstonedReport = await verifyHome({ home: tombstoned, sessionId: DELETED })
+  assert.equal(tombstonedReport.failures, 0, renderReport(tombstonedReport).join('\n'))
+  assert.ok(
+    renderReport(tombstonedReport).some((line) => line.startsWith('PASS  tertinggal di archivedSessionIds')),
+    renderReport(tombstonedReport).join('\n'),
+  )
+
+  // ... and a tombstone the audit does not claim fails, in both directions.
+  const strayArchive = await makeHome({ audit: true, archived: true })
+  homes.push(strayArchive)
+  const strayReport = await verifyHome({ home: strayArchive, sessionId: DELETED })
+  assert.ok(strayReport.failures > 0, 'an unrecorded archived entry must fail')
+  assert.ok(
+    strayReport.checks.filter((entry) => !entry.ok).some((entry) => entry.label.startsWith('tidak tertinggal di archivedSessionIds')),
+    renderReport(strayReport).join('\n'),
+  )
+
+  const missingArchive = await makeHome({ audit: true, tombstone: true })
+  homes.push(missingArchive)
+  const missingReport = await verifyHome({ home: missingArchive, sessionId: DELETED })
+  assert.ok(missingReport.failures > 0, 'a recorded tombstone must be present in the registry')
+  assert.ok(
+    missingReport.checks.filter((entry) => !entry.ok).some((entry) => entry.label.startsWith('tertinggal di archivedSessionIds')),
+    renderReport(missingReport).join('\n'),
+  )
 
   // Nothing deleted yet fails, and names the right checks.
   const untouched = await makeHome({ deletedAccounted: true, deletedDir: true })
