@@ -1,0 +1,5 @@
+# Bundle layer: one Host row. The browser half is discovered from this
+# package's `dsh.client` declaration, so it needs no second row.
+- insert:
+    - id: session-delete
+      name: 'harness-session-delete'
